@@ -145,8 +145,11 @@ class SpotWelderApp(QMainWindow):
                 QMessageBox.warning(self, "警告", "未检测到有效的电流脉冲，请检查数据。")
                 return
 
-            start = max(0, active_idx[0] - 100)
-            end = min(len(df_raw) - 1, active_idx[-1] + 200)
+            pulse_start_idx = int(active_idx[0])
+            pulse_end_idx = int(active_idx[-1])
+
+            start = max(0, pulse_start_idx - 100)
+            end = min(len(df_raw) - 1, pulse_end_idx + 200)
             data = df_raw.iloc[start:end + 1].copy()
 
             # CH1 是焊点两端绝对电压，不能减去静态基准
@@ -154,8 +157,12 @@ class SpotWelderApp(QMainWindow):
             v_diff = (data['CH2_mV'] - ch2_zero) / 1000.0
             data['I_A'] = (v_diff * V_DIVIDER_RATIO / SENSITIVITY) * AMPS_PER_MT
 
-            # 你的要求：暂时不改这里的阈值，保持原样
-            valid_mask = np.abs(data['I_A']) > (0.1 * AMPS_PER_MT)
+            # 仅在电流脉冲主体内计算阻抗，避免停焊段小电流把 R=U/I 放大到 100Ω+。
+            # 这里使用“固定下限 + 峰值比例下限”的组合门限，兼顾不同量程。
+            peak_current = data['I_A'].abs().max()
+            current_threshold = max(0.1 * AMPS_PER_MT, 0.1 * peak_current)
+            in_pulse_window = (data.index >= pulse_start_idx) & (data.index <= pulse_end_idx)
+            valid_mask = in_pulse_window & (data['I_A'].abs() > current_threshold)
             data['R_ohm'] = np.nan
             data.loc[valid_mask, 'R_ohm'] = np.abs(data.loc[valid_mask, 'U_V'] / data.loc[valid_mask, 'I_A'])
 
