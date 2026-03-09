@@ -4,9 +4,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 导入 PySide6 核心组件
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QMessageBox)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QMessageBox,
+)
 from PySide6.QtCore import Qt
 
 # 导入 Matplotlib 的 Qt 后端
@@ -76,7 +87,8 @@ class SpotWelderApp(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"])
+            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         main_layout.addWidget(self.table, stretch=2)
 
@@ -104,8 +116,13 @@ class SpotWelderApp(QMainWindow):
                         break
 
             # 读取数据
-            df_raw = pd.read_csv(self.csv_filepath, encoding='gbk', skiprows=skip_rows, header=None,
-                                 names=['Index', 'CH1_mV', 'CH2_mV'])
+            df_raw = pd.read_csv(
+                self.csv_filepath,
+                encoding='gbk',
+                skiprows=skip_rows,
+                header=None,
+                names=['Index', 'CH1_mV', 'CH2_mV'],
+            )
 
             # --- 硬件与物理参数配置 ---
             U_SCALE = 1.0 / 1000.0
@@ -114,26 +131,38 @@ class SpotWelderApp(QMainWindow):
             AMPS_PER_MT = 1.0  # 暂时保持 1.0
 
             # --- 提取与计算 ---
-            ch1_zero = df_raw['CH1_mV'][:100].mean()
             ch2_zero = df_raw['CH2_mV'][:100].mean()
 
-            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > 80
+            # 基于前100点噪声自适应阈值（并保留80mV下限，兼容旧逻辑）
+            ch2_baseline = df_raw['CH2_mV'][:100]
+            ch2_sigma = ch2_baseline.std(ddof=0)
+            pulse_threshold = max(80.0, 6.0 * ch2_sigma)
+
+            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > pulse_threshold
             active_idx = df_raw.index[pulse_mask]
 
             if len(active_idx) == 0:
                 QMessageBox.warning(self, "警告", "未检测到有效的电流脉冲，请检查数据。")
                 return
 
-            start = max(0, active_idx[0] - 100)
-            end = min(len(df_raw) - 1, active_idx[-1] + 200)
-            data = df_raw.iloc[start:end].copy()
+            pulse_start_idx = int(active_idx[0])
+            pulse_end_idx = int(active_idx[-1])
 
+            start = max(0, pulse_start_idx - 100)
+            end = min(len(df_raw) - 1, pulse_end_idx + 200)
+            data = df_raw.iloc[start:end + 1].copy()
+
+            # CH1 是焊点两端绝对电压，不能减去静态基准
             data['U_V'] = data['CH1_mV'] * U_SCALE
             v_diff = (data['CH2_mV'] - ch2_zero) / 1000.0
             data['I_A'] = (v_diff * V_DIVIDER_RATIO / SENSITIVITY) * AMPS_PER_MT
 
-            # 你的要求：暂时不改这里的阈值，保持原样
-            valid_mask = np.abs(data['I_A']) > (0.1 * AMPS_PER_MT)
+            # 仅在电流脉冲主体内计算阻抗，避免停焊段小电流把 R=U/I 放大到 100Ω+。
+            # 这里使用“固定下限 + 峰值比例下限”的组合门限，兼顾不同量程。
+            peak_current = data['I_A'].abs().max()
+            current_threshold = max(0.1 * AMPS_PER_MT, 0.1 * peak_current)
+            in_pulse_window = (data.index >= pulse_start_idx) & (data.index <= pulse_end_idx)
+            valid_mask = in_pulse_window & (data['I_A'].abs() > current_threshold)
             data['R_ohm'] = np.nan
             data.loc[valid_mask, 'R_ohm'] = np.abs(data.loc[valid_mask, 'U_V'] / data.loc[valid_mask, 'I_A'])
 
@@ -177,9 +206,11 @@ class SpotWelderApp(QMainWindow):
         self.canvas.ax3.grid(True, alpha=0.5)
 
         # 限幅防止无穷大撑爆图表
+        data['R_ohm'] = data['R_ohm'].replace([np.inf, -np.inf], np.nan)
         r_clean = data['R_ohm'].dropna()
         if not r_clean.empty:
-            self.canvas.ax3.set_ylim(0, r_clean.median() * 5)
+            max_y = max(r_clean.median() * 5, 0.001)
+            self.canvas.ax3.set_ylim(0, max_y)
 
         self.canvas.draw()
 
