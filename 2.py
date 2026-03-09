@@ -4,9 +4,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 导入 PySide6 核心组件
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QMessageBox)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QMessageBox,
+)
 from PySide6.QtCore import Qt
 
 # 导入 Matplotlib 的 Qt 后端
@@ -32,6 +43,18 @@ class MplCanvas(FigureCanvas):
 
 
 class SpotWelderApp(QMainWindow):
+    BASELINE_SAMPLES = 100
+    PRE_TRIGGER_SAMPLES = 100
+    POST_TRIGGER_SAMPLES = 200
+    MIN_PULSE_THRESHOLD_MV = 80.0
+    NOISE_SIGMA_FACTOR = 6.0
+
+    # --- 硬件与物理参数配置 ---
+    U_SCALE = 1.0 / 1000.0
+    V_DIVIDER_RATIO = 15.1 / 10.0
+    SENSITIVITY = 0.25
+    AMPS_PER_MT = 1.0
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("点焊机动态阻抗分析系统")
@@ -76,7 +99,8 @@ class SpotWelderApp(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"])
+            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         main_layout.addWidget(self.table, stretch=2)
 
@@ -95,58 +119,82 @@ class SpotWelderApp(QMainWindow):
             return
 
         try:
-            # 自动跳过 OWON 的非数据表头
-            skip_rows = 0
-            with open(self.csv_filepath, 'r', encoding='gbk', errors='ignore') as f:
-                for i, line in enumerate(f):
-                    if line.startswith('1,'):
-                        skip_rows = i
-                        break
+            df_raw = self._read_csv_data(self.csv_filepath)
+            if df_raw.empty:
+                QMessageBox.warning(self, "警告", "CSV 文件中没有可用数据。")
+                return
 
-            # 读取数据
-            df_raw = pd.read_csv(self.csv_filepath, encoding='gbk', skiprows=skip_rows, header=None,
-                                 names=['Index', 'CH1_mV', 'CH2_mV'])
+            baseline_samples = min(self.BASELINE_SAMPLES, len(df_raw))
+            ch2_baseline = df_raw['CH2_mV'].iloc[:baseline_samples]
+            ch2_zero = ch2_baseline.mean()
 
-            # --- 硬件与物理参数配置 ---
-            U_SCALE = 1.0 / 1000.0
-            V_DIVIDER_RATIO = 15.1 / 10.0
-            SENSITIVITY = 0.25
-            AMPS_PER_MT = 1.0  # 暂时保持 1.0
+            # 基于前导段噪声做自适应阈值（保留 80mV 下限）
+            ch2_sigma = ch2_baseline.std(ddof=0)
+            pulse_threshold = max(self.MIN_PULSE_THRESHOLD_MV, self.NOISE_SIGMA_FACTOR * ch2_sigma)
 
-            # --- 提取与计算 ---
-            ch1_zero = df_raw['CH1_mV'][:100].mean()
-            ch2_zero = df_raw['CH2_mV'][:100].mean()
-
-            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > 80
+            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > pulse_threshold
             active_idx = df_raw.index[pulse_mask]
 
             if len(active_idx) == 0:
                 QMessageBox.warning(self, "警告", "未检测到有效的电流脉冲，请检查数据。")
                 return
 
-            start = max(0, active_idx[0] - 100)
-            end = min(len(df_raw) - 1, active_idx[-1] + 200)
-            data = df_raw.iloc[start:end].copy()
+            pulse_start_idx = int(active_idx[0])
+            pulse_end_idx = int(active_idx[-1])
 
-            data['U_V'] = data['CH1_mV'] * U_SCALE
+            start = max(0, pulse_start_idx - self.PRE_TRIGGER_SAMPLES)
+            end = min(len(df_raw) - 1, pulse_end_idx + self.POST_TRIGGER_SAMPLES)
+            data = df_raw.iloc[start:end + 1].copy()
+
+            # CH1 是焊点两端绝对电压，不能减去静态基准
+            data['U_V'] = data['CH1_mV'] * self.U_SCALE
             v_diff = (data['CH2_mV'] - ch2_zero) / 1000.0
-            data['I_A'] = (v_diff * V_DIVIDER_RATIO / SENSITIVITY) * AMPS_PER_MT
+            data['I_A'] = (v_diff * self.V_DIVIDER_RATIO / self.SENSITIVITY) * self.AMPS_PER_MT
 
-            # 你的要求：暂时不改这里的阈值，保持原样
-            valid_mask = np.abs(data['I_A']) > (0.1 * AMPS_PER_MT)
+            # 仅在电流脉冲主体内计算阻抗，避免停焊段小电流把 R=U/I 放大到异常值。
+            peak_current = data['I_A'].abs().max()
+            current_threshold = max(0.1 * self.AMPS_PER_MT, 0.1 * peak_current)
+            in_pulse_window = (data.index >= pulse_start_idx) & (data.index <= pulse_end_idx)
+            valid_mask = in_pulse_window & (data['I_A'].abs() > current_threshold)
+
             data['R_ohm'] = np.nan
-            data.loc[valid_mask, 'R_ohm'] = np.abs(data.loc[valid_mask, 'U_V'] / data.loc[valid_mask, 'I_A'])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                resistance = np.abs(data['U_V'] / data['I_A'])
+            data.loc[valid_mask, 'R_ohm'] = resistance[valid_mask]
+            data['R_ohm'] = data['R_ohm'].replace([np.inf, -np.inf], np.nan)
 
             self.processed_data = data
 
-            # --- 更新图表 ---
+            # --- 更新图表与表格 ---
             self.update_canvas()
-
-            # --- 更新表格 ---
             self.update_table()
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"处理数据时发生错误:\n{str(e)}")
+
+    def _read_csv_data(self, filepath):
+        """读取 OWON 导出的 CSV 并完成基础清洗。"""
+        skip_rows = 0
+        with open(filepath, 'r', encoding='gbk', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if line.startswith('1,'):
+                    skip_rows = i
+                    break
+
+        df_raw = pd.read_csv(
+            filepath,
+            encoding='gbk',
+            skiprows=skip_rows,
+            header=None,
+            names=['Index', 'CH1_mV', 'CH2_mV'],
+        )
+
+        # 强制转数值并剔除异常行，避免字符串/空行破坏后续计算
+        for col in ['Index', 'CH1_mV', 'CH2_mV']:
+            df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
+        df_raw = df_raw.dropna(subset=['Index', 'CH1_mV', 'CH2_mV']).reset_index(drop=True)
+
+        return df_raw
 
     def update_canvas(self):
         """刷新 Matplotlib 画布"""
@@ -170,16 +218,18 @@ class SpotWelderApp(QMainWindow):
         self.canvas.ax2.grid(True, alpha=0.5)
 
         # 3. 绘制阻抗
-        self.canvas.ax3.plot(data['Index'], data['R_ohm'], 'g-')
+        r_series = data['R_ohm'].replace([np.inf, -np.inf], np.nan)
+        self.canvas.ax3.plot(data['Index'], r_series, 'g-')
         self.canvas.ax3.set_title("动态接触阻抗 (R=U/I)")
         self.canvas.ax3.set_ylabel("阻抗 (Ω)")
         self.canvas.ax3.set_xlabel("采样序列号 (Index)")
         self.canvas.ax3.grid(True, alpha=0.5)
 
-        # 限幅防止无穷大撑爆图表
-        r_clean = data['R_ohm'].dropna()
+        # 限幅防止极端值撑爆图表
+        r_clean = r_series.dropna()
         if not r_clean.empty:
-            self.canvas.ax3.set_ylim(0, r_clean.median() * 5)
+            max_y = max(r_clean.median() * 5, 0.001)
+            self.canvas.ax3.set_ylim(0, max_y)
 
         self.canvas.draw()
 
@@ -188,15 +238,15 @@ class SpotWelderApp(QMainWindow):
         data = self.processed_data
         self.table.setRowCount(len(data))
 
-        for row, (_, row_data) in enumerate(data.iterrows()):
+        for row, row_data in enumerate(data.itertuples(index=False)):
             # 填充每一列数据，格式化小数位数
-            idx_item = QTableWidgetItem(str(int(row_data['Index'])))
-            ch1_item = QTableWidgetItem(f"{row_data['CH1_mV']:.2f}")
-            u_item = QTableWidgetItem(f"{row_data['U_V']:.4f}")
-            i_item = QTableWidgetItem(f"{row_data['I_A']:.4f}")
+            idx_item = QTableWidgetItem(str(int(row_data.Index)))
+            ch1_item = QTableWidgetItem(f"{row_data.CH1_mV:.2f}")
+            u_item = QTableWidgetItem(f"{row_data.U_V:.4f}")
+            i_item = QTableWidgetItem(f"{row_data.I_A:.4f}")
 
             # 处理 NaN 的显示
-            r_val = row_data['R_ohm']
+            r_val = row_data.R_ohm
             r_str = f"{r_val:.4f}" if not pd.isna(r_val) else "无效/无穷大"
             r_item = QTableWidgetItem(r_str)
 
