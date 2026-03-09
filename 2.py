@@ -117,7 +117,12 @@ class SpotWelderApp(QMainWindow):
             ch1_zero = df_raw['CH1_mV'][:100].mean()
             ch2_zero = df_raw['CH2_mV'][:100].mean()
 
-            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > 80
+            # 基于前100点噪声自适应阈值（并保留80mV下限，兼容旧逻辑）
+            ch2_baseline = df_raw['CH2_mV'][:100]
+            ch2_sigma = ch2_baseline.std(ddof=0)
+            pulse_threshold = max(80.0, 6.0 * ch2_sigma)
+
+            pulse_mask = np.abs(df_raw['CH2_mV'] - ch2_zero) > pulse_threshold
             active_idx = df_raw.index[pulse_mask]
 
             if len(active_idx) == 0:
@@ -126,9 +131,10 @@ class SpotWelderApp(QMainWindow):
 
             start = max(0, active_idx[0] - 100)
             end = min(len(df_raw) - 1, active_idx[-1] + 200)
-            data = df_raw.iloc[start:end].copy()
+            data = df_raw.iloc[start:end + 1].copy()
 
-            data['U_V'] = data['CH1_mV'] * U_SCALE
+            # 电压同样进行零点修正，避免偏置电压影响阻抗计算
+            data['U_V'] = (data['CH1_mV'] - ch1_zero) * U_SCALE
             v_diff = (data['CH2_mV'] - ch2_zero) / 1000.0
             data['I_A'] = (v_diff * V_DIVIDER_RATIO / SENSITIVITY) * AMPS_PER_MT
 
