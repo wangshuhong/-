@@ -4,9 +4,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # 导入 PySide6 核心组件
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
-                               QHeaderView, QMessageBox)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QMessageBox,
+)
 from PySide6.QtCore import Qt
 
 # 导入 Matplotlib 的 Qt 后端
@@ -76,7 +87,8 @@ class SpotWelderApp(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"])
+            ["采样索引 (Index)", "原始 CH1 (mV)", "真实电压 U (V)", "折算电流 I (A)", "动态阻抗 R (Ω)"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         main_layout.addWidget(self.table, stretch=2)
 
@@ -104,8 +116,13 @@ class SpotWelderApp(QMainWindow):
                         break
 
             # 读取数据
-            df_raw = pd.read_csv(self.csv_filepath, encoding='gbk', skiprows=skip_rows, header=None,
-                                 names=['Index', 'CH1_mV', 'CH2_mV'])
+            df_raw = pd.read_csv(
+                self.csv_filepath,
+                encoding='gbk',
+                skiprows=skip_rows,
+                header=None,
+                names=['Index', 'CH1_mV', 'CH2_mV'],
+            )
 
             # --- 硬件与物理参数配置 ---
             U_SCALE = 1.0 / 1000.0
@@ -114,7 +131,6 @@ class SpotWelderApp(QMainWindow):
             AMPS_PER_MT = 1.0  # 暂时保持 1.0
 
             # --- 提取与计算 ---
-            ch1_zero = df_raw['CH1_mV'][:100].mean()
             ch2_zero = df_raw['CH2_mV'][:100].mean()
 
             # 基于前100点噪声自适应阈值（并保留80mV下限，兼容旧逻辑）
@@ -133,8 +149,8 @@ class SpotWelderApp(QMainWindow):
             end = min(len(df_raw) - 1, active_idx[-1] + 200)
             data = df_raw.iloc[start:end + 1].copy()
 
-            # 电压同样进行零点修正，避免偏置电压影响阻抗计算
-            data['U_V'] = (data['CH1_mV'] - ch1_zero) * U_SCALE
+            # CH1 是焊点两端绝对电压，不能减去静态基准
+            data['U_V'] = data['CH1_mV'] * U_SCALE
             v_diff = (data['CH2_mV'] - ch2_zero) / 1000.0
             data['I_A'] = (v_diff * V_DIVIDER_RATIO / SENSITIVITY) * AMPS_PER_MT
 
@@ -183,9 +199,11 @@ class SpotWelderApp(QMainWindow):
         self.canvas.ax3.grid(True, alpha=0.5)
 
         # 限幅防止无穷大撑爆图表
+        data['R_ohm'] = data['R_ohm'].replace([np.inf, -np.inf], np.nan)
         r_clean = data['R_ohm'].dropna()
         if not r_clean.empty:
-            self.canvas.ax3.set_ylim(0, r_clean.median() * 5)
+            max_y = max(r_clean.median() * 5, 0.001)
+            self.canvas.ax3.set_ylim(0, max_y)
 
         self.canvas.draw()
 
